@@ -95,6 +95,7 @@ pub struct Folder {
   subscription: Subscription,
   #[allow(dead_code)]
   notifier: Option<FolderNotify>,
+  pub section_view_relations: Arc<HashMap<String, Vec<String>>>,
 }
 
 impl Folder {
@@ -199,8 +200,19 @@ impl Folder {
       .iter()
       .map(|view| view.as_ref().clone())
       .collect::<Vec<View>>();
+
+    let mut section_view_relations = HashMap::new();
     for view in self.views.get_views_belong_to_with_txn(&txn, workspace_id) {
-      views.extend(self.get_view_recursively_with_txn(&txn, &view.id));
+      let views_belong_to = self.get_view_recursively_with_txn(&txn, &view.id);
+      views.extend(views_belong_to.clone());
+
+      // Extract all the view ids from view_belong_to:
+      let view_ids = views_belong_to
+        .iter()
+        .map(|view| view.id.clone())
+        .collect::<Vec<_>>();
+
+      section_view_relations.insert(view.id.clone(), view_ids);
     }
     views.extend(orphan_views);
 
@@ -235,6 +247,7 @@ impl Folder {
       recent,
       trash,
       private,
+      section_view_relations,
     })
   }
 
@@ -521,65 +534,80 @@ fn create_folder<T: Into<UserId>>(
   let uid = uid.into();
   let collab_guard = collab.lock();
   let index_json_sender = collab_guard.index_json_sender.clone();
-  let (folder, views, section, meta, subscription) = collab_guard.with_origin_transact_mut(|txn| {
-    // create the folder
-    let mut folder = collab_guard.insert_map_with_txn_if_not_exist(txn, FOLDER);
-    let subscription = subscribe_folder_change(&mut folder);
+  let (folder, views, section, meta, subscription, section_view_relations) = collab_guard
+    .with_origin_transact_mut(|txn| {
+      // create the folder
+      let mut folder = collab_guard.insert_map_with_txn_if_not_exist(txn, FOLDER);
+      let subscription = subscribe_folder_change(&mut folder);
 
-    // create the folder data
-    let views = folder.create_map_with_txn_if_not_exist(txn, VIEWS);
-    let section = folder.create_map_with_txn_if_not_exist(txn, SECTION);
-    let meta = folder.create_map_with_txn_if_not_exist(txn, FOLDER_META);
-    let view_relations = Rc::new(ViewRelations::new(
-      folder.create_map_with_txn_if_not_exist(txn, VIEW_RELATION),
-    ));
+      // create the folder data
+      let views = folder.create_map_with_txn_if_not_exist(txn, VIEWS);
+      let section = folder.create_map_with_txn_if_not_exist(txn, SECTION);
+      let meta = folder.create_map_with_txn_if_not_exist(txn, FOLDER_META);
+      let view_relations = Rc::new(ViewRelations::new(
+        folder.create_map_with_txn_if_not_exist(txn, VIEW_RELATION),
+      ));
 
-    let section = Rc::new(SectionMap::create(
-      txn,
-      &uid,
-      section,
-      notifier
-        .as_ref()
-        .map(|notifier| notifier.section_change_tx.clone()),
-    ));
-    let views = Rc::new(ViewsMap::new(
-      &uid,
-      views,
-      notifier
-        .as_ref()
-        .map(|notifier| notifier.view_change_tx.clone()),
-      view_relations,
-      section.clone(),
-      index_json_sender,
-      HashMap::new(),
-    ));
+      let section = Rc::new(SectionMap::create(
+        txn,
+        &uid,
+        section,
+        notifier
+          .as_ref()
+          .map(|notifier| notifier.section_change_tx.clone()),
+      ));
+      let views = Rc::new(ViewsMap::new(
+        &uid,
+        views,
+        notifier
+          .as_ref()
+          .map(|notifier| notifier.view_change_tx.clone()),
+        view_relations,
+        section.clone(),
+        index_json_sender,
+        HashMap::new(),
+      ));
 
-    if let Some(folder_data) = folder_data {
-      let workspace_id = folder_data.workspace.id.clone();
-      views.insert_view_with_txn(txn, folder_data.workspace.into(), None);
+      let section_view_relations = Arc::new(
+        folder_data
+          .as_ref()
+          .map(|data| data.section_view_relations.clone())
+          .unwrap_or_default(),
+      );
 
-      for view in folder_data.views {
-        views.insert_view_with_txn(txn, view, None);
-      }
+      if let Some(folder_data) = folder_data {
+        let workspace_id = folder_data.workspace.id.clone();
+        views.insert_view_with_txn(txn, folder_data.workspace.into(), None);
 
-      meta.insert_str_with_txn(txn, FOLDER_WORKSPACE_ID, workspace_id);
-      meta.insert_str_with_txn(txn, CURRENT_VIEW, folder_data.current_view);
+        for view in folder_data.views {
+          views.insert_view_with_txn(txn, view, None);
+        }
 
-      if let Some(fav_section) = section.section_op_with_txn(txn, Section::Favorite) {
-        for (uid, sections) in folder_data.favorites {
-          fav_section.add_sections_for_user_with_txn(txn, &uid, sections);
+        meta.insert_str_with_txn(txn, FOLDER_WORKSPACE_ID, workspace_id);
+        meta.insert_str_with_txn(txn, CURRENT_VIEW, folder_data.current_view);
+
+        if let Some(fav_section) = section.section_op_with_txn(txn, Section::Favorite) {
+          for (uid, sections) in folder_data.favorites {
+            fav_section.add_sections_for_user_with_txn(txn, &uid, sections);
+          }
+        }
+
+        if let Some(trash_section) = section.section_op_with_txn(txn, Section::Trash) {
+          for (uid, sections) in folder_data.trash {
+            trash_section.add_sections_for_user_with_txn(txn, &uid, sections);
+          }
         }
       }
 
-      if let Some(trash_section) = section.section_op_with_txn(txn, Section::Trash) {
-        for (uid, sections) in folder_data.trash {
-          trash_section.add_sections_for_user_with_txn(txn, &uid, sections);
-        }
-      }
-    }
-
-    (folder, views, section, meta, subscription)
-  });
+      (
+        folder,
+        views,
+        section,
+        meta,
+        subscription,
+        section_view_relations,
+      )
+    });
   drop(collab_guard);
 
   Folder {
@@ -591,6 +619,7 @@ fn create_folder<T: Into<UserId>>(
     meta,
     subscription,
     notifier,
+    section_view_relations,
   }
 }
 
@@ -652,8 +681,19 @@ fn open_folder<T: Into<UserId>>(
     view_relations,
     section_map.clone(),
     index_json_sender,
-    all_views,
+    all_views.clone(),
   ));
+
+  let section_view_relations = Arc::new(
+    all_views
+      .iter()
+      .map(|(key, value)| {
+        let view_ids = extract_child_ids_recursively(views_map.clone(), value.clone());
+        (key.clone(), view_ids)
+      })
+      .collect::<HashMap<_, _>>(),
+  );
+
   drop(txn);
   drop(collab_guard);
 
@@ -666,9 +706,21 @@ fn open_folder<T: Into<UserId>>(
     meta: meta_y_map,
     subscription: folder_sub,
     notifier,
+    section_view_relations,
   };
 
   Some(folder)
+}
+
+fn extract_child_ids_recursively(views_map: Rc<ViewsMap>, view: Arc<View>) -> Vec<String> {
+  let mut view_ids = vec![view.id.clone()];
+
+  for child in view.children.items.iter() {
+    let child_view = views_map.get_view(&child.id).unwrap();
+    view_ids.extend(extract_child_ids_recursively(views_map.clone(), child_view));
+  }
+
+  view_ids
 }
 
 fn get_views_from_root<T: ReadTxn>(

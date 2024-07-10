@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{SectionsByUid, View, Workspace};
@@ -15,6 +17,8 @@ pub struct FolderData {
   pub trash: SectionsByUid,
   #[serde(default)]
   pub private: SectionsByUid,
+  #[serde(default)]
+  pub section_view_relations: HashMap<String, Vec<String>>,
 }
 
 impl FolderData {
@@ -27,6 +31,7 @@ impl FolderData {
       recent: SectionsByUid::new(),
       trash: SectionsByUid::new(),
       private: SectionsByUid::new(),
+      section_view_relations: HashMap::new(),
     }
   }
 }
